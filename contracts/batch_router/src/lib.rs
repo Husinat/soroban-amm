@@ -61,6 +61,10 @@ pub enum BatchRouterError {
     /// `amm::add_liquidity`'s `AmmError::InsufficientShares`
     /// (`contracts/amm/src/lib.rs:1633`).
     InsufficientShares = 11,
+    Unauthorized = 12,
+    NoPendingAdmin = 13,
+    Paused = 14,
+
 }
 
 #[contracttype]
@@ -175,23 +179,111 @@ pub struct BatchRouter;
 impl BatchRouter {
     /// Initialize the router with the factory that tracks all deployed pools.
     pub fn initialize(env: Env, admin: Address, factory: Address) -> Result<(), BatchRouterError> {
+        // Prevent re-initialization.
         if env.storage().instance().has(&DataKey::Factory) {
             return Err(BatchRouterError::AlreadyInitialized);
         }
-            return Err(BatchRouterError::AlreadyInitialized);
-        }
+        // Set admin and factory.
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
+        // Emit init event.
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("initialize"),), (admin, factory));
         Ok(())
     }
+    // stray closing brace removed
 
     /// The maximum number of operations a single batch may contain.
     pub fn max_batch_ops(_env: Env) -> u32 {
         MAX_BATCH_OPS
     }
 
+    // ----- Admin lifecycle helpers -----
+    fn extend_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), BatchRouterError> {
+        let stored = env.storage().instance().get(&DataKey::Admin).ok_or(BatchRouterError::Unauthorized)?;
+        if stored != *admin {
+            return Err(BatchRouterError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), BatchRouterError> {
+        if Self::is_paused(env) {
+            return Err(BatchRouterError::Paused);
+        }
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        Self::extend_ttl(&env);
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        Self::extend_ttl(&env);
+        env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    pub fn get_factory(env: Env) -> Address {
+        Self::extend_ttl(&env);
+        env.storage().instance().get(&DataKey::Factory).unwrap()
+    }
+
+    // ----- Admin entrypoints -----
+    pub fn pause(env: Env, admin: Address) -> Result<(), BatchRouterError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("pause"),), (admin,));
+        Ok(())
+    }
+
+    pub fn unpause(env: Env, admin: Address) -> Result<(), BatchRouterError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("unpause"),), (admin,));
+        Ok(())
+    }
+
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), BatchRouterError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("propose_admin"),), (admin, new_admin));
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env, caller: Address) -> Result<(), BatchRouterError> {
+        Self::extend_ttl(&env);
+        let pending = env.storage().instance().get(&DataKey::PendingAdmin).ok_or(BatchRouterError::NoPendingAdmin)?;
+        if pending != caller {
+            return Err(BatchRouterError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &caller);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("accept_admin"),), (caller,));
+        Ok(())
+    }
+
+    // ----- Preconditions -----
+    fn check_preconditions(env: &Env, ops: &Vec<BatchOp>, deadline: u64) -> Result<(), BatchRouterError> {
+        if ops.is_empty() {
+            return Err(BatchRouterError::EmptyBatch);
+        }
+        if ops.len() > MAX_BATCH_OPS as usize {
+            return Err(BatchRouterError::BatchTooLarge);
+        }
+        if env.ledger().timestamp() > deadline {
+            return Err(BatchRouterError::DeadlineExpired);
+        }
+        Ok(())
+    }
+
     /// Execute a sequence of AMM operations atomically.
-    ///
     /// All operations share one `deadline` and a single `caller` authorization.
     /// If any step fails the entire batch reverts.
     pub fn execute_batch(
@@ -201,6 +293,8 @@ impl BatchRouter {
         deadline: u64,
     ) -> Result<Vec<BatchOpResult>, BatchRouterError> {
         env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+        // Ensure router is not paused.
+        Self::require_not_paused(&env)?;
         caller.require_auth();
         Self::check_preconditions(&env, &ops, deadline)?;
 
@@ -292,22 +386,7 @@ impl BatchRouter {
         }
     }
 
-    fn check_preconditions(
-        env: &Env,
-        ops: &Vec<BatchOp>,
-        deadline: u64,
-    ) -> Result<(), BatchRouterError> {
-        if ops.is_empty() {
-            return Err(BatchRouterError::EmptyBatch);
-        }
-        if ops.len() > MAX_BATCH_OPS {
-            return Err(BatchRouterError::BatchTooLarge);
-        }
-        if env.ledger().timestamp() > deadline {
-            return Err(BatchRouterError::DeadlineExpired);
-        }
-        Ok(())
-    }
+
 
     fn op_kind(env: &Env, op: &BatchOp) -> Symbol {
         match op {
@@ -715,7 +794,9 @@ mod tests {
     fn deploy_router<'a>(env: &'a Env, factory_addr: &Address) -> BatchRouterClient<'a> {
         let batch_addr = env.register_contract(None, BatchRouter);
         let batch_client = BatchRouterClient::new(env, &batch_addr);
-        batch_client.initialize(factory_addr);
+        // Use a temporary admin for testing; in real deployment the admin is provided by the caller.
+        let admin = Address::generate(env);
+        batch_client.initialize(&admin, factory_addr);
         batch_client
     }
 
