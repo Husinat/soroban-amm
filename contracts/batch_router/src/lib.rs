@@ -178,6 +178,8 @@ impl BatchRouter {
         if env.storage().instance().has(&DataKey::Factory) {
             return Err(BatchRouterError::AlreadyInitialized);
         }
+            return Err(BatchRouterError::AlreadyInitialized);
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
         Ok(())
