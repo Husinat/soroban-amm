@@ -14,6 +14,10 @@ const BUMP_TO: u32 = 518_400;
 #[contracttype]
 pub enum DataKey {
     Factory,
+    Admin,
+    PendingAdmin,
+    /// true while paused
+    Paused,
 }
 
 /// Pool type for distinguishing between AMM and concentrated liquidity pools.
@@ -170,10 +174,11 @@ pub struct BatchRouter;
 #[contractimpl]
 impl BatchRouter {
     /// Initialize the router with the factory that tracks all deployed pools.
-    pub fn initialize(env: Env, factory: Address) -> Result<(), BatchRouterError> {
+    pub fn initialize(env: Env, admin: Address, factory: Address) -> Result<(), BatchRouterError> {
         if env.storage().instance().has(&DataKey::Factory) {
             return Err(BatchRouterError::AlreadyInitialized);
         }
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
         Ok(())
     }
