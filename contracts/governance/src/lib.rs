@@ -23,7 +23,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
 };
 
-use soroban_amm_sdk::types::TokenError;
+use soroban_amm_sdk::types::SdkTokenError as TokenError;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +103,10 @@ pub enum GovernanceError {
     NotInitialized = 35,
     /// Proposal parameters failed validation (e.g., invalid vesting schedule).
     InvalidProposalParams = 36,
+    /// A delegation would make a chain longer than `MAX_DELEGATION_DEPTH` (or a
+    /// stored chain was found to exceed it during aggregation). Rejected at write
+    /// time so voting power is never silently dropped from a tally.
+    DelegationDepthExceeded = 37,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -387,7 +391,8 @@ pub trait AmmPoolInterface {
     fn set_protocol_fee(env: Env, admin: Address, recipient: Address, protocol_fee_bps: i128);
     fn pause(env: Env);
     fn unpause(env: Env);
-    fn emergency_withdraw(env: Env, to: Address);
+    fn announce_emergency_withdraw(env: Env, admin: Address, to: Address);
+    fn emergency_withdraw(env: Env, admin: Address, to: Address);
     fn propose_admin(env: Env, current_admin: Address, new_admin: Address);
     fn set_lp_locker(env: Env, locker: Address);
 }
@@ -769,10 +774,8 @@ impl Governance {
                     return Err(GovernanceError::InvalidFeeBps);
                 }
             }
-            ProposalKind::TransferAdmin(_new_admin) => {}
             ProposalKind::PausePool => {}
             ProposalKind::UnpausePool => {}
-            ProposalKind::EmergencyWithdraw(_) => {}
             ProposalKind::UpdateFactoryTreasury(params) => {
                 if !(0..=MAX_BPS).contains(&params.global_protocol_fee_bps) {
                     return Err(GovernanceError::InvalidFeeBps);
@@ -786,10 +789,6 @@ impl Governance {
                     return Err(GovernanceError::PartialFactoryUpdate);
                 }
             }
-            ProposalKind::CreatePolVesting(_) => {}
-            ProposalKind::PauseClPool(_) => {}
-            ProposalKind::UnpauseClPool(_) => {}
-            ProposalKind::UpdateClOracle(_) => {}
             ProposalKind::UpdateClMaxOracleDeviation(params) => {
                 if !(0..=MAX_BPS).contains(&params.max_deviation_bps) {
                     return Err(GovernanceError::InvalidFeeBps);
@@ -867,7 +866,8 @@ impl Governance {
         // Use total_supply_at to get the supply at snapshot_ledger, preventing
         // quorum manipulation by same-ledger mint/burn.
         let snapshot_total_supply = lp_client
-            .total_supply_at(&snapshot_ledger)
+            .try_total_supply_at(&snapshot_ledger)
+            .map_err(|_| GovernanceError::InsufficientSnapshotBal)?
             .map_err(|_| GovernanceError::InsufficientSnapshotBal)?;
         if snapshot_total_supply == 0 {
             return Err(GovernanceError::ZeroTotalSupply);
@@ -949,6 +949,15 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
+
+        // The AMM requires emergency withdrawals to be announced and to wait out
+        // its own delay, even when governance is the admin. Start that clock now
+        // so it runs concurrently with the voting period and timelock.
+        if let ProposalKind::EmergencyWithdraw(to) = &kind {
+            let amm_pool = Self::read_amm_pool(&env)?;
+            AmmPoolClient::new(&env, &amm_pool)
+                .announce_emergency_withdraw(&env.current_contract_address(), to);
+        }
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -1147,7 +1156,13 @@ impl Governance {
                 amm_client.unpause();
             }
             ProposalKind::EmergencyWithdraw(to) => {
-                amm_client.emergency_withdraw(to);
+                // The pool only drains while paused and after the announced
+                // delay (announced when the proposal was created). Pausing is
+                // idempotent and has already been voted on as part of this
+                // proposal.
+                let self_addr = env.current_contract_address();
+                amm_client.pause();
+                amm_client.emergency_withdraw(&self_addr, to);
             }
             ProposalKind::UpdateFactoryTreasury(params) => {
                 let self_addr = env.current_contract_address();
@@ -1366,8 +1381,14 @@ impl Governance {
         if from == to {
             return Err(GovernanceError::CannotDelegateToSelf);
         }
-        if Self::delegation_reaches(&env, &to, &from, 0) {
-            return Err(GovernanceError::DelegationCycle);
+        // Exact write-time checks (no depth cut-off): the walk up from `to`
+        // either reaches `from` (a cycle of any length) or ends at a terminal
+        // delegatee, giving `depth(to)`. Together with `height(from)` this
+        // keeps every stored chain within MAX_DELEGATION_DEPTH by construction.
+        let to_depth = Self::delegation_depth_or_cycle(&env, &to, &from)?;
+        let from_height = Self::delegation_height(&env, &from, 0)?;
+        if to_depth + 1 + from_height > MAX_DELEGATION_DEPTH {
+            return Err(GovernanceError::DelegationDepthExceeded);
         }
 
         if let Some(old) = Self::get_delegate(env.clone(), from.clone()) {
@@ -1786,12 +1807,11 @@ impl Governance {
         locks: &mut Vec<(Address, i128)>,
         depth: u32,
     ) -> Result<(), GovernanceError> {
-        // Depth is a traversal bound, not a validity check: `delegate` already
-        // rejects cycles, so a chain longer than MAX_DELEGATION_DEPTH is simply a
-        // long honest chain. Stop walking instead of erroring, otherwise the
-        // terminal delegatee could never vote at all.
+        // `delegate` enforces the bound at write time, so this is unreachable for
+        // well-formed state. Never truncate silently: dropping a delegator here
+        // would discard their voting power without any error.
         if depth > MAX_DELEGATION_DEPTH {
-            return Ok(());
+            return Err(GovernanceError::DelegationDepthExceeded);
         }
         let voted_key = DataKey::HasVoted(proposal.id, holder.clone());
         if !env.storage().persistent().has(&voted_key) {
@@ -1825,18 +1845,55 @@ impl Governance {
         Ok(())
     }
 
-    fn delegation_reaches(env: &Env, current: &Address, target: &Address, depth: u32) -> bool {
-        if depth > MAX_DELEGATION_DEPTH {
-            return false;
+    /// Walk up from `start` following `Delegate` links and return the number of
+    /// edges to the terminal delegatee. Fails with `DelegationCycle` if the walk
+    /// reaches `from` (the account about to delegate), which is an exact cycle
+    /// check independent of length. A step budget guards against corrupt state.
+    fn delegation_depth_or_cycle(
+        env: &Env,
+        start: &Address,
+        from: &Address,
+    ) -> Result<u32, GovernanceError> {
+        let mut current = start.clone();
+        let mut edges: u32 = 0;
+        loop {
+            if current == *from {
+                return Err(GovernanceError::DelegationCycle);
+            }
+            match Self::get_delegate(env.clone(), current.clone()) {
+                Some(next) => {
+                    edges += 1;
+                    if edges > MAX_DELEGATION_DEPTH {
+                        return Err(GovernanceError::DelegationDepthExceeded);
+                    }
+                    current = next;
+                }
+                None => return Ok(edges),
+            }
         }
-        if current == target {
-            return true;
+    }
+
+    /// Longest delegation path (in edges) below `node`, following the delegator
+    /// index. Errors rather than truncating if the bound is exceeded.
+    fn delegation_height(env: &Env, node: &Address, depth: u32) -> Result<u32, GovernanceError> {
+        let count_key = DataKey::DelegatorCount(node.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count == 0 {
+            return Ok(0);
         }
-        if let Some(next) = Self::get_delegate(env.clone(), current.clone()) {
-            Self::delegation_reaches(env, &next, target, depth + 1)
-        } else {
-            false
+        if depth >= MAX_DELEGATION_DEPTH {
+            return Err(GovernanceError::DelegationDepthExceeded);
         }
+        let mut height = 0;
+        for i in 0..count {
+            let delegator: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Delegator(node.clone(), i))
+                .unwrap();
+            height = height.max(1 + Self::delegation_height(env, &delegator, depth + 1)?);
+        }
+        Ok(height)
     }
 
     fn add_delegator_index(env: &Env, delegatee: &Address, delegator: &Address) {
@@ -2009,6 +2066,7 @@ impl Governance {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use amm::AmmPool;
     use concentrated_liquidity::ConcentratedLiquidity;
@@ -2095,6 +2153,7 @@ mod tests {
     #[test]
     fn test_passing_proposal_executes() {
         let s = setup_suite(30);
+        s.env.budget().reset_unlimited();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
 
         let lp1 = Address::generate(&s.env);
@@ -4270,7 +4329,9 @@ mod tests {
             let mut state = seed;
             for _ in 0..5 {
                 let d = Address::generate(&s.env);
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 mint_lp(&s, &d, 50 + ((state >> 33) % 500) as i128);
                 gov.delegate(&d, &delegatee);
                 delegators.push_back(d);
@@ -4279,7 +4340,9 @@ mod tests {
             let pid = propose_at_ledger(&s, &gov, &proposer);
 
             for d in delegators.iter() {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
                 let held = lp.balance(&d);
                 match (state >> 33) % 3 {
                     0 => {}
@@ -4396,9 +4459,396 @@ mod tests {
         assert_eq!(gov.get_proposal_count(), 0);
         assert_eq!(gov.get_proposals_paginated(&0, &10).len(), 0);
     }
-}
 
-// ── Property-based tests ───────────────────────────────────────────────────────
+    // ── Delegation depth bound enforced at write time (#1106) ─────────────────
+
+    fn lp_locked(s: &Suite, who: &Address) -> i128 {
+        token::LpTokenClient::new(&s.env, &s.lp_addr).locked_balance(who)
+    }
+
+    /// Create `n` funded accounts, each holding 100 LP.
+    fn funded_accounts(s: &Suite, n: u32) -> std::vec::Vec<Address> {
+        (0..n)
+            .map(|_| {
+                let a = Address::generate(&s.env);
+                mint_lp(s, &a, 100);
+                a
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_delegation_depth_error_discriminant_is_appended() {
+        assert_eq!(GovernanceError::NotInitialized as u32, 35);
+        assert_eq!(GovernanceError::DelegationDepthExceeded as u32, 37);
+    }
+
+    #[test]
+    fn test_chain_of_exactly_max_depth_is_counted_and_locked() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 1);
+        let proposer = Address::generate(&s.env);
+        mint_lp(&s, &proposer, 500);
+
+        // nodes[0] -> nodes[1] -> ... -> nodes[8]: exactly 8 edges.
+        for i in 0..MAX_DELEGATION_DEPTH as usize {
+            gov.delegate(&nodes[i], &nodes[i + 1]);
+        }
+        let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(50));
+        let terminal = &nodes[MAX_DELEGATION_DEPTH as usize];
+        gov.vote(terminal, &pid, &Vote::For);
+
+        // Every member's power is counted (including the deepest delegator).
+        assert_eq!(
+            gov.get_proposal(&pid).votes_for,
+            100 * (MAX_DELEGATION_DEPTH as i128 + 1)
+        );
+        for n in nodes.iter() {
+            assert_eq!(lp_locked(&s, n), 100);
+        }
+    }
+
+    #[test]
+    fn test_chain_one_longer_than_max_is_rejected_at_delegate_time() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 2);
+        for i in 0..MAX_DELEGATION_DEPTH as usize {
+            gov.delegate(&nodes[i], &nodes[i + 1]);
+        }
+        let last = MAX_DELEGATION_DEPTH as usize;
+        assert_eq!(
+            gov.try_delegate(&nodes[last], &nodes[last + 1]),
+            Err(Ok(GovernanceError::DelegationDepthExceeded))
+        );
+        assert_eq!(gov.get_delegate(&nodes[last]), None);
+    }
+
+    #[test]
+    fn test_prepending_to_a_maximal_chain_is_rejected() {
+        // Delegating a *new* delegator onto the head of a maximal chain's
+        // terminal is height-based: it must be rejected as well.
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 2);
+        for i in 0..MAX_DELEGATION_DEPTH as usize {
+            gov.delegate(&nodes[i], &nodes[i + 1]);
+        }
+        // nodes[9] delegates to the terminal's head? terminal is nodes[8]; adding a
+        // delegator below nodes[0] (the deepest) exceeds the bound.
+        assert_eq!(
+            gov.try_delegate(&nodes[9], &nodes[0]),
+            Err(Ok(GovernanceError::DelegationDepthExceeded))
+        );
+    }
+
+    #[test]
+    fn test_long_cycle_is_rejected_by_any_construction_order() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, 12);
+
+        // Forward order: a chain of 12 members can never be completed.
+        let mut rejected = false;
+        for i in 0..11usize {
+            if gov.try_delegate(&nodes[i], &nodes[i + 1]).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "a chain of 12 members must be rejected");
+        // The closing call of a 12-cycle can never be accepted.
+        assert!(gov.try_delegate(&nodes[11], &nodes[0]).is_err());
+
+        // Reverse order on a fresh set.
+        let rev = funded_accounts(&s, 12);
+        let mut rejected = false;
+        for i in (0..11usize).rev() {
+            if gov.try_delegate(&rev[i], &rev[i + 1]).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected);
+        assert!(gov.try_delegate(&rev[11], &rev[0]).is_err());
+    }
+
+    #[test]
+    fn test_cycle_closing_a_maximal_chain_is_rejected_as_cycle() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 1);
+        for i in 0..MAX_DELEGATION_DEPTH as usize {
+            gov.delegate(&nodes[i], &nodes[i + 1]);
+        }
+        assert_eq!(
+            gov.try_delegate(&nodes[MAX_DELEGATION_DEPTH as usize], &nodes[0]),
+            Err(Ok(GovernanceError::DelegationCycle))
+        );
+        // The head can still vote directly after a rejected closing call.
+        assert_eq!(
+            gov.get_delegate(&nodes[MAX_DELEGATION_DEPTH as usize]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_delegating_a_node_with_delegators_respects_its_height() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let n = funded_accounts(&s, 12);
+        // Chain X: n0 -> n1 -> n2 -> n3 (height of n3 is 0, depth 3 from n0).
+        gov.delegate(&n[0], &n[1]);
+        gov.delegate(&n[1], &n[2]);
+        gov.delegate(&n[2], &n[3]);
+        // Chain Y: n4 -> n5 -> ... -> n8 (4 edges).
+        for i in 4..8usize {
+            gov.delegate(&n[i], &n[i + 1]);
+        }
+        // Attaching n3 (terminal of X, height 3) under n8 (depth 0) gives
+        // 3 + 1 + 0 = 4 below n8, but n4 is already 4 below n8: total path
+        // n0 .. n8 has 3 + 1 + 4 = 8 edges: accepted.
+        gov.delegate(&n[3], &n[4]);
+        // One more edge at the bottom now exceeds the bound.
+        assert_eq!(
+            gov.try_delegate(&n[10], &n[0]),
+            Err(Ok(GovernanceError::DelegationDepthExceeded))
+        );
+    }
+
+    #[test]
+    fn test_undelegate_from_middle_of_chain_frees_depth() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 2);
+        for i in 0..MAX_DELEGATION_DEPTH as usize {
+            gov.delegate(&nodes[i], &nodes[i + 1]);
+        }
+        let extra = &nodes[MAX_DELEGATION_DEPTH as usize + 1];
+        assert!(gov.try_delegate(extra, &nodes[0]).is_err());
+        // Cut the chain in the middle; the lower half is now shorter.
+        gov.undelegate(&nodes[4]);
+        gov.delegate(extra, &nodes[0]);
+        assert_eq!(gov.get_delegate(extra), Some(nodes[0].clone()));
+    }
+
+    #[test]
+    fn test_redelegation_moves_depth_to_new_chain() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let n = funded_accounts(&s, 12);
+        // Deep chain: n1 -> n2 -> ... -> n8 (7 edges).
+        for i in 1..8usize {
+            gov.delegate(&n[i], &n[i + 1]);
+        }
+        // n0 under the deep chain's head would give 8 edges: ok.
+        gov.delegate(&n[0], &n[1]);
+        // Re-delegating n0 from n1 to the terminal n8 shortens the chain.
+        gov.delegate(&n[0], &n[8]);
+        // n9 can now sit under n1 (n1's height is now 0).
+        gov.delegate(&n[9], &n[1]);
+        assert_eq!(gov.get_delegate(&n[0]), Some(n[8].clone()));
+        // Re-delegating inside the same chain to a deeper spot is checked afresh.
+        let res = gov.try_delegate(&n[8], &n[10]);
+        assert!(
+            res == Err(Ok(GovernanceError::DelegationCycle))
+                || res == Err(Ok(GovernanceError::DelegationDepthExceeded))
+        );
+    }
+
+    #[test]
+    fn test_rejected_delegate_keeps_existing_delegation() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 3);
+        for i in 0..MAX_DELEGATION_DEPTH as usize {
+            gov.delegate(&nodes[i], &nodes[i + 1]);
+        }
+        let x = &nodes[MAX_DELEGATION_DEPTH as usize + 1];
+        let y = &nodes[MAX_DELEGATION_DEPTH as usize + 2];
+        gov.delegate(x, y);
+        // Re-delegating x under the maximal chain's deepest node fails and
+        // leaves x -> y untouched.
+        assert!(gov.try_delegate(x, &nodes[0]).is_err());
+        assert_eq!(gov.get_delegate(x), Some(y.clone()));
+    }
+
+    /// Reference model of the delegation graph used by the randomized test.
+    fn model_depth(map: &std::collections::BTreeMap<u32, u32>, mut n: u32) -> Option<u32> {
+        let mut edges = 0;
+        while let Some(&next) = map.get(&n) {
+            edges += 1;
+            n = next;
+            if edges > 64 {
+                return None;
+            }
+        }
+        Some(edges)
+    }
+
+    fn model_longest(map: &std::collections::BTreeMap<u32, u32>, nodes: u32) -> u32 {
+        (0..nodes)
+            .map(|n| model_depth(map, n).unwrap_or(u32::MAX))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_randomized_delegate_undelegate_matches_model() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let s = setup_suite(30);
+                let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+                let count = 12u32;
+                let nodes = funded_accounts(&s, count);
+                let mut model: std::collections::BTreeMap<u32, u32> =
+                    std::collections::BTreeMap::new();
+                let mut seed: u64 = 0x1234_5678_9abc_def0;
+                let mut next = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u32
+                };
+                for _ in 0..250 {
+                    s.env.budget().reset_unlimited();
+                    let from = next() % count;
+                    if next() % 5 == 0 {
+                        gov.undelegate(&nodes[from as usize]);
+                        model.remove(&from);
+                    } else {
+                        let to = next() % count;
+                        let mut candidate = model.clone();
+                        candidate.remove(&from);
+                        // Expected outcome.
+                        let expected = if from == to {
+                            Some(GovernanceError::CannotDelegateToSelf)
+                        } else if model_depth(&candidate, to).is_some() && {
+                            // does the walk up from `to` reach `from`?
+                            let mut cur = to;
+                            let mut hit = false;
+                            let mut steps = 0;
+                            while let Some(&nx) = candidate.get(&cur) {
+                                steps += 1;
+                                if steps > count {
+                                    break;
+                                }
+                                cur = nx;
+                                if cur == from {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            hit
+                        } {
+                            Some(GovernanceError::DelegationCycle)
+                        } else {
+                            candidate.insert(from, to);
+                            if model_longest(&candidate, count) > MAX_DELEGATION_DEPTH {
+                                Some(GovernanceError::DelegationDepthExceeded)
+                            } else {
+                                None
+                            }
+                        };
+                        let res = gov.try_delegate(&nodes[from as usize], &nodes[to as usize]);
+                        match expected {
+                            None => {
+                                assert_eq!(res, Ok(Ok(())));
+                                model.insert(from, to);
+                            }
+                            Some(e) => assert_eq!(res, Err(Ok(e))),
+                        }
+                    }
+                    // Every stored delegate matches the model and the bound holds.
+                    assert!(model_longest(&model, count) <= MAX_DELEGATION_DEPTH);
+                    for i in 0..count {
+                        let stored = gov.get_delegate(&nodes[i as usize]);
+                        assert_eq!(stored, model.get(&i).map(|t| nodes[*t as usize].clone()));
+                    }
+                }
+                // Undelegating always restores direct voting for every account.
+                let proposer = Address::generate(&s.env);
+                mint_lp(&s, &proposer, 500);
+                for n in nodes.iter() {
+                    gov.undelegate(n);
+                }
+                let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(50));
+                for n in nodes.iter() {
+                    gov.vote(n, &pid, &Vote::For);
+                }
+                assert_eq!(gov.get_proposal(&pid).votes_for, 100 * count as i128);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_vote_on_corrupt_overlong_chain_errors_instead_of_truncating() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let nodes = funded_accounts(&s, MAX_DELEGATION_DEPTH + 2);
+        let proposer = Address::generate(&s.env);
+        mint_lp(&s, &proposer, 500);
+        // Force an over-long chain directly in storage (as if written by an
+        // older contract version that only checked on read).
+        s.env.as_contract(&s.gov_addr, || {
+            for i in 0..=(MAX_DELEGATION_DEPTH as usize) {
+                s.env
+                    .storage()
+                    .persistent()
+                    .set(&DataKey::Delegate(nodes[i].clone()), &nodes[i + 1]);
+                Governance::add_delegator_index(&s.env, &nodes[i + 1], &nodes[i]);
+            }
+        });
+        let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(50));
+        let terminal = &nodes[MAX_DELEGATION_DEPTH as usize + 1];
+        assert_eq!(
+            gov.try_vote(terminal, &pid, &Vote::For),
+            Err(Ok(GovernanceError::DelegationDepthExceeded))
+        );
+        // Nobody is stuck: every member can undelegate and vote directly.
+        gov.undelegate(&nodes[0]);
+        gov.vote(&nodes[0], &pid, &Vote::For);
+    }
+
+    #[test]
+    fn test_vote_on_maximal_fan_out_tree_reports_budget() {
+        let s = setup_suite(30);
+        s.env.budget().reset_unlimited();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let root = Address::generate(&s.env);
+        mint_lp(&s, &root, 100);
+        let proposer = Address::generate(&s.env);
+        mint_lp(&s, &proposer, 500);
+        let mut expected = 100i128;
+        for _ in 0..50 {
+            let child = Address::generate(&s.env);
+            mint_lp(&s, &child, 100);
+            gov.delegate(&child, &root);
+            expected += 100;
+            for _ in 0..2 {
+                let leaf = Address::generate(&s.env);
+                mint_lp(&s, &leaf, 100);
+                gov.delegate(&leaf, &child);
+                expected += 100;
+            }
+        }
+        let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(50));
+        s.env.budget().reset_unlimited();
+        let before_cpu = s.env.budget().cpu_instruction_cost();
+        gov.vote(&root, &pid, &Vote::For);
+        let cpu = s.env.budget().cpu_instruction_cost() - before_cpu;
+        std::println!("fan-out vote (151 accounts) cpu instructions: {cpu}");
+        assert_eq!(gov.get_proposal(&pid).votes_for, expected);
+        assert!(
+            cpu < 2_000_000_000,
+            "vote exceeded the instruction budget: {cpu}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod prop_tests {
@@ -5469,13 +5919,17 @@ mod prop_tests {
         lp.mint(&other, &4_000_i128);
 
         // Advance to ledger 10
-        s.env.ledger().set(10, 10_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 10;
+            l.timestamp = 10_000;
+        });
 
         // Holder removes all liquidity in ledger 10
         lp.burn(&holder, &6_000_i128);
 
-        // Propose in the same ledger - snapshot is ledger 9
-        let pid = gov.propose(&holder, &ProposalKind::UpdateFee(50));
+        // Propose in the same ledger - snapshot is ledger 9. The burned holder
+        // has no live balance left, so the remaining holder proposes.
+        let pid = gov.propose(&other, &ProposalKind::UpdateFee(50));
 
         let proposal = gov.get_proposal(&pid);
         // snapshot_total_supply should be 10,000 (pre-removal), not 4,000
@@ -5495,7 +5949,10 @@ mod prop_tests {
         lp.mint(&holder, &1_000_i128);
 
         // Advance to ledger 10
-        s.env.ledger().set(10, 10_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 10;
+            l.timestamp = 10_000;
+        });
 
         // Propose - snapshot is ledger 9
         let pid = gov.propose(&holder, &ProposalKind::UpdateFee(50));
@@ -5522,19 +5979,31 @@ mod prop_tests {
         let holder = Address::generate(&s.env);
 
         // Mint at ledger 1
-        s.env.ledger().set(1, 1_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 1;
+            l.timestamp = 1_000;
+        });
         lp.mint(&holder, &1_000_i128);
 
         // Mint at ledger 2
-        s.env.ledger().set(2, 2_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 2;
+            l.timestamp = 2_000;
+        });
         lp.mint(&holder, &500_i128);
 
         // Burn at ledger 3
-        s.env.ledger().set(3, 3_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 3;
+            l.timestamp = 3_000;
+        });
         lp.burn(&holder, &200_i128);
 
         // Propose at ledger 4 - snapshot is ledger 3
-        s.env.ledger().set(4, 4_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 4;
+            l.timestamp = 4_000;
+        });
         let pid = gov.propose(&holder, &ProposalKind::UpdateFee(50));
 
         let proposal = gov.get_proposal(&pid);
@@ -5543,9 +6012,9 @@ mod prop_tests {
         assert_eq!(proposal.snapshot_ledger, 3);
 
         // Verify total_supply_at returns correct values for each ledger
-        assert_eq!(lp.total_supply_at(&1), Ok(1_000));
-        assert_eq!(lp.total_supply_at(&2), Ok(1_500));
-        assert_eq!(lp.total_supply_at(&3), Ok(1_300));
+        assert_eq!(lp.total_supply_at(&1), 1_000);
+        assert_eq!(lp.total_supply_at(&2), 1_500);
+        assert_eq!(lp.total_supply_at(&3), 1_300);
     }
 
     #[test]
@@ -5558,7 +6027,10 @@ mod prop_tests {
         let holder = Address::generate(&s.env);
         lp.mint(&holder, &1_000_i128);
 
-        s.env.ledger().set(10, 10_000);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 10;
+            l.timestamp = 10_000;
+        });
 
         // Invalid CreatePolVesting: total <= 0
         let pol_vesting = Address::generate(&s.env);
@@ -5638,6 +6110,8 @@ mod prop_tests {
             cliff_ledger: 30,
             end_ledger: 40,
         };
-        assert!(gov.try_propose(&holder, &ProposalKind::CreatePolVesting(valid_vesting)).is_ok());
+        assert!(gov
+            .try_propose(&holder, &ProposalKind::CreatePolVesting(valid_vesting))
+            .is_ok());
     }
 }
